@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch
+*.pth
+*.pt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Dataset
+data/cifar-10-batches-py/
+data/cifar-10-python.tar.gz
+data/MNIST/
+data/*.tar.gz
+data/*.zip
+
+# Outputs
+outputs/*
+!outputs/.gitkeep
+swanlog/*
+!swanlog/.gitkeep
+*.json
+*.log
+
+# Flower framework (large external dependency)
+flower/
+
+# Temporary files
+*.tmp
+.DS_Store
+CLEANUP_SUMMARY.txt
+
+# Training checkpoints and results
+checkpoints/
+results/
+runs/
+*.ckpt

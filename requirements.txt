@@ -1,0 +1,6 @@
+torch>=2.0
+torchvision>=0.15
+numpy>=1.23
+tqdm>=4.65
+# Optional visualization/logging dependency
+swanlab>=0.3.29
