@@ -129,6 +129,31 @@ def unflatten_state_dict(
     return result
 
 
+def ensure_finite_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    fallback_state: Dict[str, torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], bool]:
+    """Replace non-finite entries (NaN/Inf) with values from fallback state.
+
+    Returns sanitized state dict and a flag indicating whether the original
+    state was already finite (True) or required sanitization (False).
+    """
+    sanitized: Dict[str, torch.Tensor] = {}
+    is_finite = True
+    for key, tensor in state_dict.items():
+        finite_mask = torch.isfinite(tensor)
+        if not torch.all(finite_mask):
+            fallback_tensor = fallback_state[key].to(tensor.device)
+            cleaned = tensor.clone()
+            cleaned = cleaned.to(fallback_tensor.dtype)
+            cleaned[~finite_mask] = fallback_tensor[~finite_mask]
+            sanitized[key] = cleaned
+            is_finite = False
+        else:
+            sanitized[key] = tensor
+    return sanitized, is_finite
+
+
 def geometric_median_state_dicts(
     state_dicts: Sequence[Dict[str, torch.Tensor]],
     weights: Sequence[float] | None = None,

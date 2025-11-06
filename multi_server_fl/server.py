@@ -11,6 +11,7 @@ from tqdm import tqdm
 from .client import Client
 from .utils import (
     clone_state_dict,
+    ensure_finite_state_dict,
     geometric_median_state_dicts,
     weighted_average_state_dicts,
 )
@@ -94,6 +95,7 @@ class ParameterServer:
         weights: List[int] = []
         client_metrics: List[Dict[str, float]] = []
         client_ids: List[int] = []
+        client_finite_flags: List[bool] = []
 
         # Determine if we should use parallel execution
         max_workers = self.config.max_workers
@@ -122,10 +124,13 @@ class ParameterServer:
 
                 for future in iterator:
                     client_id, client_state, metrics, num_samples = future.result()
+                    sanitized_state, is_finite = ensure_finite_state_dict(client_state, initial_state)
+                    metrics["nan_detected"] = 0.0 if is_finite else 1.0
                     client_ids.append(client_id)
-                    client_states.append(client_state)
+                    client_states.append(sanitized_state)
                     client_metrics.append(metrics)
                     weights.append(num_samples)
+                    client_finite_flags.append(is_finite)
         else:
             # Sequential execution (original behavior)
             iterator = clients
@@ -136,10 +141,13 @@ class ParameterServer:
                 client_id, client_state, metrics, num_samples = self._train_single_client(
                     client, initial_state, test_loader
                 )
+                sanitized_state, is_finite = ensure_finite_state_dict(client_state, initial_state)
+                metrics["nan_detected"] = 0.0 if is_finite else 1.0
                 client_ids.append(client_id)
-                client_states.append(client_state)
+                client_states.append(sanitized_state)
                 client_metrics.append(metrics)
                 weights.append(num_samples)
+                client_finite_flags.append(is_finite)
 
         if self.client_attack:
             client_states = self.client_attack.apply(
@@ -150,13 +158,18 @@ class ParameterServer:
             )
 
         aggregated_state = self._aggregate_client_states(client_states, weights)
+        aggregated_state, aggregated_finite = ensure_finite_state_dict(aggregated_state, initial_state)
+        if not aggregated_finite:
+            aggregated_state = clone_state_dict(initial_state)
 
         acceptance_results: List[Dict[str, float]] = []
         acceptance_flags: List[bool] = []
-        for state, client in zip(client_states, clients):
+        for state, client, finite_ok in zip(client_states, clients, client_finite_flags):
             feedback = client.process_server_update(
                 aggregated_state, state, round_idx, metadata=None
             )
+            if not finite_ok:
+                feedback["nan_detected"] = 1.0
             acceptance_results.append(feedback)
             acceptance_flags.append(bool(feedback.get("accepted", 0.0)))
 

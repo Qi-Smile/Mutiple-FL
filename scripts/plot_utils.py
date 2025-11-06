@@ -15,14 +15,20 @@ def _load_history(path: Path) -> List[Dict]:
 
 def extract_metric_curve(
     history: Iterable[Dict],
-    metric_key: str = "test_accuracy_mean",
+    metric_key: str = "benign_test_accuracy_mean",
 ) -> Tuple[List[int], List[Optional[float]]]:
     rounds = []
     values: List[Optional[float]] = []
     for entry in history:
         rounds.append(entry.get("round", len(rounds) + 1))
         aggregated = entry.get("aggregated", {})
-        values.append(aggregated.get(metric_key))
+        value = aggregated.get(metric_key)
+        if value is None and metric_key.startswith("benign_"):
+            fallback_key = metric_key.replace("benign_", "")
+            value = aggregated.get(fallback_key)
+        elif value is None:
+            value = aggregated.get(f"benign_{metric_key}")
+        values.append(value)
     return rounds, values
 
 
@@ -42,7 +48,7 @@ def plot_benign_accuracy_curves(
 
     for idx, (label, path) in enumerate(histories.items()):
         history = _load_history(Path(path))
-        rounds, acc = extract_metric_curve(history, "test_accuracy_mean")
+        rounds, acc = extract_metric_curve(history, "benign_test_accuracy_mean")
         style = line_styles[idx % len(line_styles)]
         marker = markers[idx % len(markers)]
         color = colors[idx % len(colors)]

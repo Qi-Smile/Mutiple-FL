@@ -18,7 +18,7 @@ from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
 
 from .flower_client import FlowerClient
-from .utils import clone_state_dict
+from .utils import clone_state_dict, ensure_finite_state_dict
 
 try:
     from .attacks import ClientAttackController, ServerAttackController
@@ -207,7 +207,9 @@ class FlowerParameterServer:
                 for future in as_completed(future_to_client):
                     updated_params, num_examples, metrics, client_id = future.result()
                     fit_results.append((updated_params, num_examples, metrics))
-                    client_states.append(self._params_to_state_dict(updated_params))
+                    state_dict = self._params_to_state_dict(updated_params)
+                    sanitized_state, is_finite = ensure_finite_state_dict(state_dict, initial_state)
+                    client_states.append(sanitized_state)
                     client_ids.append(client_id)
                     weight_list.append(num_examples)
         else:
@@ -217,7 +219,9 @@ class FlowerParameterServer:
                     client, initial_parameters, config
                 )
                 fit_results.append((updated_params, num_examples, metrics))
-                client_states.append(self._params_to_state_dict(updated_params))
+                state_dict = self._params_to_state_dict(updated_params)
+                sanitized_state, is_finite = ensure_finite_state_dict(state_dict, initial_state)
+                client_states.append(sanitized_state)
                 client_ids.append(client_id)
                 weight_list.append(num_examples)
 
@@ -244,8 +248,10 @@ class FlowerParameterServer:
         else:
             aggregated_state = self._params_to_state_dict(aggregated_params)
 
+        sanitized_state, _ = ensure_finite_state_dict(aggregated_state, initial_state)
+        sanitized_params = self._state_dict_to_params(sanitized_state)
         # Update server model
-        self.set_parameters(aggregated_params)
+        self.set_parameters(sanitized_params)
 
         # === PARALLEL CLIENT EVALUATION ===
         evaluate_results = []
@@ -254,7 +260,7 @@ class FlowerParameterServer:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_client = {
                     executor.submit(
-                        self._evaluate_single_client, client, aggregated_params, config
+                        self._evaluate_single_client, client, sanitized_params, config
                     ): client
                     for client in clients
                 }
@@ -266,7 +272,7 @@ class FlowerParameterServer:
             # Sequential evaluation
             for client in clients:
                 loss, num_examples, metrics, _ = self._evaluate_single_client(
-                    client, aggregated_params, config
+                    client, sanitized_params, config
                 )
                 evaluate_results.append((loss, num_examples, metrics))
 

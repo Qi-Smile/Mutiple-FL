@@ -18,7 +18,7 @@ from flwr.common import NDArrays, Scalar
 
 from .flower_client import FlowerClient
 from .flower_server import FlowerParameterServer, FlowerServerConfig
-from .utils import clone_state_dict
+from .utils import clone_state_dict, ensure_finite_state_dict
 
 try:
     from .attacks import ClientAttackController, ServerAttackController
@@ -235,8 +235,11 @@ class MultiGPUFlowerServer(FlowerParameterServer):
                 for future in as_completed(future_to_client):
                     client_id, gpu_id = future_to_client[future]
                     updated_params, num_examples, metrics, _ = future.result()
-                    fit_results.append((updated_params, num_examples, metrics))
-                    client_states.append(self._params_to_state_dict(updated_params))
+                    state_dict = self._params_to_state_dict(updated_params)
+                    sanitized_state, _ = ensure_finite_state_dict(state_dict, initial_state)
+                    sanitized_params = self._state_dict_to_params(sanitized_state)
+                    fit_results.append((sanitized_params, num_examples, metrics))
+                    client_states.append(sanitized_state)
                     client_ids.append(client_id)
                     weight_list.append(num_examples)
                     print(f"        ✓ Client {client_id} done (GPU {gpu_id})")
@@ -251,8 +254,11 @@ class MultiGPUFlowerServer(FlowerParameterServer):
                 updated_params, num_examples, metrics, _ = self._train_single_client(
                     client, initial_parameters, config
                 )
-                fit_results.append((updated_params, num_examples, metrics))
-                client_states.append(self._params_to_state_dict(updated_params))
+                state_dict = self._params_to_state_dict(updated_params)
+                sanitized_state, _ = ensure_finite_state_dict(state_dict, initial_state)
+                sanitized_params = self._state_dict_to_params(sanitized_state)
+                fit_results.append((sanitized_params, num_examples, metrics))
+                client_states.append(sanitized_state)
                 client_ids.append(client.client_id)
                 weight_list.append(num_examples)
 
@@ -271,11 +277,10 @@ class MultiGPUFlowerServer(FlowerParameterServer):
         # Aggregate results
         aggregated_params = self._aggregate_fit_results(fit_results)
         aggregated_state = self._params_to_state_dict(aggregated_params)
+        aggregated_state, _ = ensure_finite_state_dict(aggregated_state, initial_state)
         if self.server_attack:
             aggregated_state = self.server_attack.apply(self.server_id, aggregated_state)
-            aggregated_params = self._state_dict_to_params(aggregated_state)
-        else:
-            aggregated_state = self._params_to_state_dict(aggregated_params)
+        aggregated_params = self._state_dict_to_params(aggregated_state)
         self.set_parameters(aggregated_params)
 
         # Evaluate

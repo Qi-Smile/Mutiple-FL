@@ -135,6 +135,8 @@ class MultiServerFederatedRunner:
                 mean, var = compute_weighted_mean_and_variance(values, weights)
                 aggregated_metrics[f"benign_{metric_name}_mean"] = mean
                 aggregated_metrics[f"benign_{metric_name}_var"] = var
+                aggregated_metrics[f"{metric_name}_mean"] = mean
+                aggregated_metrics[f"{metric_name}_var"] = var
 
         record = {
             "round": round_idx,
