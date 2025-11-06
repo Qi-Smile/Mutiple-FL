@@ -14,11 +14,18 @@ warnings.simplefilter("ignore", DeprecationWarning)
 import argparse
 import json
 from pathlib import Path
+from typing import Dict
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from multi_server_fl.attacks import (
+    ClientAttackConfig,
+    ClientAttackController,
+    ServerAttackConfig,
+    ServerAttackController,
+)
 from multi_server_fl.data.partition import dirichlet_partition
 from multi_server_fl.data.utils import load_torchvision_dataset, subset_dataset
 from multi_server_fl.flower_client import create_flower_client
@@ -44,12 +51,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy", type=str, default="fedavg", help="FL strategy")
     parser.add_argument("--max-workers", type=int, default=100, help="Parallel client workers")
     parser.add_argument("--output", type=str, default="./flower_results.json")
+    parser.add_argument("--malicious-client-ratio", type=float, default=0.0, help="Fraction of malicious clients (m_c)")
+    parser.add_argument("--malicious-server-ratio", type=float, default=0.0, help="Fraction of malicious servers (m_p)")
+    parser.add_argument("--client-attack", type=str, default="none", help="Client attack strategy name")
+    parser.add_argument(
+        "--client-attack-params",
+        type=str,
+        default="{}",
+        help="JSON dict with extra client attack parameters",
+    )
+    parser.add_argument("--server-attack", type=str, default="none", help="Server attack strategy name")
+    parser.add_argument(
+        "--server-attack-params",
+        type=str,
+        default="{}",
+        help="JSON dict with extra server attack parameters",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     set_torch_seed(args.seed)
+
+    def _load_params(param_str: str) -> Dict:
+        if not param_str:
+            return {}
+        try:
+            data = json.loads(param_str)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid JSON for attack parameters: {exc}") from exc
+        if not isinstance(data, dict):
+            raise SystemExit("Attack parameters must be provided as a JSON object.")
+        return data
+
+    client_attack_params = _load_params(args.client_attack_params)
+    server_attack_params = _load_params(args.server_attack_params)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -125,6 +162,28 @@ def main():
         )
         clients.append(client)
 
+    # Determine malicious participants
+    num_malicious_clients = max(0, min(args.num_clients, int(round(args.num_clients * args.malicious_client_ratio))))
+    num_malicious_servers = max(0, min(args.num_servers, int(round(args.num_servers * args.malicious_server_ratio))))
+
+    malicious_client_ids = set(range(num_malicious_clients))
+    malicious_server_ids = set(range(num_malicious_servers))
+
+    client_attack_controller = ClientAttackController(
+        malicious_client_ids=malicious_client_ids,
+        config=ClientAttackConfig(
+            name=args.client_attack,
+            params=client_attack_params,
+        ),
+    )
+    server_attack_controller = ServerAttackController(
+        malicious_server_ids=malicious_server_ids,
+        config=ServerAttackConfig(
+            name=args.server_attack,
+            params=server_attack_params,
+        ),
+    )
+
     # Create Flower servers
     parallel_info = f" (parallel: {args.max_workers} workers)" if args.max_workers else " (sequential)"
     print(f"✓ Creating {args.num_servers} Flower servers with {args.strategy} strategy{parallel_info}...")
@@ -136,6 +195,8 @@ def main():
             device=device,
             strategy=args.strategy,
             max_workers=args.max_workers,
+            client_attack=client_attack_controller,
+            server_attack=server_attack_controller,
         )
         servers.append(server)
 

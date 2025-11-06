@@ -42,6 +42,10 @@ class MultiServerFederatedRunner:
         self.config = config
         self.logger = logger or MetricLogger()
         self.history: List[Dict] = []
+        self.client_roles: Dict[int, bool] = {
+            client.client_id: bool(getattr(client, "is_malicious", False))
+            for client in self.clients
+        }
 
         if self.config.seed is not None:
             random.seed(self.config.seed)
@@ -65,8 +69,9 @@ class MultiServerFederatedRunner:
         self,
         server: ParameterServer,
         assigned_clients: Sequence[Client],
+        round_idx: int,
     ) -> ServerRoundResult:
-        return server.run_round(assigned_clients, self.test_loader)
+        return server.run_round(assigned_clients, self.test_loader, round_idx)
 
     def run(self) -> List[Dict]:
         round_iterator = range(1, self.config.num_rounds + 1)
@@ -79,7 +84,10 @@ class MultiServerFederatedRunner:
 
             # Run servers sequentially (client parallelism happens within each server)
             for server, clients in zip(self.servers, assignments):
-                round_results.append(self._run_server_round(server, clients))
+                round_results.append(self._run_server_round(server, clients, round_idx))
+
+            if self.logger:
+                self._log_client_metrics(round_idx, round_results)
 
             metrics_record = self._summarize_round(round_idx, round_results)
             self.history.append(metrics_record)
@@ -100,19 +108,33 @@ class MultiServerFederatedRunner:
         detailed: List[Dict] = []
 
         for result in round_results:
-            for client_id, metrics in zip(result.client_ids, result.client_metrics):
-                detailed.append({"server_id": result.server_id, "client_id": client_id, **metrics})
-                weights.append(metrics["num_samples"])
-                for key, value in metrics.items():
-                    if key == "num_samples":
-                        continue
-                    all_metrics.setdefault(key, []).append(value)
+            acceptance_list = result.client_acceptance or [True] * len(result.client_ids)
+            feedback_list = result.client_feedback or [{} for _ in result.client_ids]
+            for client_id, metrics, accepted, feedback in zip(
+                result.client_ids,
+                result.client_metrics,
+                acceptance_list,
+                feedback_list,
+            ):
+                metrics_with_flags = {**metrics, "accepted": float(accepted)}
+                if feedback and "similarity" in feedback:
+                    metrics_with_flags["similarity"] = float(feedback["similarity"])
+                role_flag = bool(self.client_roles.get(client_id, False))
+                metrics_with_flags["role"] = "byzantine" if role_flag else "benign"
+                detailed.append({"server_id": result.server_id, "client_id": client_id, **metrics_with_flags})
+                if not role_flag:  # only aggregate benign clients
+                    weights.append(metrics["num_samples"])
+                    for key, value in metrics_with_flags.items():
+                        if key in {"num_samples", "role"}:
+                            continue
+                        all_metrics.setdefault(key, []).append(value)
 
         aggregated_metrics: Dict[str, float] = {}
-        for metric_name, values in all_metrics.items():
-            mean, var = compute_weighted_mean_and_variance(values, weights)
-            aggregated_metrics[f"{metric_name}_mean"] = mean
-            aggregated_metrics[f"{metric_name}_var"] = var
+        if weights:
+            for metric_name, values in all_metrics.items():
+                mean, var = compute_weighted_mean_and_variance(values, weights)
+                aggregated_metrics[f"benign_{metric_name}_mean"] = mean
+                aggregated_metrics[f"benign_{metric_name}_var"] = var
 
         record = {
             "round": round_idx,
@@ -120,3 +142,38 @@ class MultiServerFederatedRunner:
             "details": detailed,
         }
         return record
+
+    def _log_client_metrics(
+        self,
+        round_idx: int,
+        round_results: Sequence[ServerRoundResult],
+    ) -> None:
+        if not self.logger:
+            return
+        metrics_payload: Dict[str, float] = {}
+        for result in round_results:
+            acceptance_list = result.client_acceptance or [True] * len(result.client_ids)
+            feedback_list = result.client_feedback or [{} for _ in result.client_ids]
+            for client_id, metrics, accepted, feedback in zip(
+                result.client_ids,
+                result.client_metrics,
+                acceptance_list,
+                feedback_list,
+            ):
+                role = "byzantine" if self.client_roles.get(client_id, False) else "benign"
+                prefix = f"{role}_client_{client_id}"
+                if "train_loss" in metrics:
+                    metrics_payload[f"{prefix}/train_loss"] = float(metrics["train_loss"])
+                if "train_accuracy" in metrics:
+                    metrics_payload[f"{prefix}/train_accuracy"] = float(metrics["train_accuracy"])
+                if "test_loss" in metrics:
+                    metrics_payload[f"{prefix}/test_loss"] = float(metrics["test_loss"])
+                if "test_accuracy" in metrics:
+                    metrics_payload[f"{prefix}/test_accuracy"] = float(metrics["test_accuracy"])
+                metrics_payload[f"{prefix}/accepted"] = 1.0 if accepted else 0.0
+                if feedback and "similarity" in feedback:
+                    metrics_payload[f"{prefix}/similarity"] = float(feedback["similarity"])
+                if feedback and "threshold" in feedback:
+                    metrics_payload[f"{prefix}/threshold"] = float(feedback["threshold"])
+        if metrics_payload:
+            self.logger.log(metrics_payload, step=round_idx)

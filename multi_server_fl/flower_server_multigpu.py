@@ -18,6 +18,13 @@ from flwr.common import NDArrays, Scalar
 
 from .flower_client import FlowerClient
 from .flower_server import FlowerParameterServer, FlowerServerConfig
+from .utils import clone_state_dict
+
+try:
+    from .attacks import ClientAttackController, ServerAttackController
+except ImportError:  # pragma: no cover
+    ClientAttackController = None  # type: ignore
+    ServerAttackController = None  # type: ignore
 
 
 def _train_client_on_gpu(
@@ -110,6 +117,8 @@ class MultiGPUFlowerServer(FlowerParameterServer):
         strategy: str = "fedavg",
         auto_gpu: bool = True,
         gpu_ids: Optional[List[int]] = None,
+        client_attack: Optional["ClientAttackController"] = None,
+        server_attack: Optional["ServerAttackController"] = None,
     ):
         """Initialize multi-GPU Flower server.
 
@@ -121,7 +130,15 @@ class MultiGPUFlowerServer(FlowerParameterServer):
             auto_gpu: If True, automatically detect and use all GPUs
             gpu_ids: Specific GPU IDs to use (overrides auto_gpu)
         """
-        super().__init__(server_id, model_builder, device, strategy)
+        config = FlowerServerConfig(server_id=server_id, strategy_name=strategy)
+        super().__init__(
+            server_id=server_id,
+            model_builder=model_builder,
+            device=device,
+            config=config,
+            client_attack=client_attack,
+            server_attack=server_attack,
+        )
 
         # Configure GPUs
         if gpu_ids is not None:
@@ -170,6 +187,7 @@ class MultiGPUFlowerServer(FlowerParameterServer):
 
         config = config or {}
         initial_parameters = self.get_parameters()
+        initial_state = clone_state_dict(self.model.state_dict())
 
         # Determine if we can use multi-GPU parallelism
         use_multigpu = (
@@ -179,6 +197,9 @@ class MultiGPUFlowerServer(FlowerParameterServer):
         )
 
         fit_results = []
+        client_states: List[Dict[str, torch.Tensor]] = []
+        client_ids: List[int] = []
+        weight_list: List[int] = []
 
         if use_multigpu:
             # TRUE multi-GPU parallel training
@@ -215,6 +236,9 @@ class MultiGPUFlowerServer(FlowerParameterServer):
                     client_id, gpu_id = future_to_client[future]
                     updated_params, num_examples, metrics, _ = future.result()
                     fit_results.append((updated_params, num_examples, metrics))
+                    client_states.append(self._params_to_state_dict(updated_params))
+                    client_ids.append(client_id)
+                    weight_list.append(num_examples)
                     print(f"        ✓ Client {client_id} done (GPU {gpu_id})")
         else:
             # Fallback to sequential training
@@ -228,9 +252,30 @@ class MultiGPUFlowerServer(FlowerParameterServer):
                     client, initial_parameters, config
                 )
                 fit_results.append((updated_params, num_examples, metrics))
+                client_states.append(self._params_to_state_dict(updated_params))
+                client_ids.append(client.client_id)
+                weight_list.append(num_examples)
+
+        if self.client_attack and client_states:
+            client_states = self.client_attack.apply(
+                initial_state=initial_state,
+                client_states=client_states,
+                client_ids=client_ids,
+                weights=weight_list,
+            )
+            for idx, state in enumerate(client_states):
+                attacked_params = self._state_dict_to_params(state)
+                _, num_examples, metrics = fit_results[idx]
+                fit_results[idx] = (attacked_params, num_examples, metrics)
 
         # Aggregate results
         aggregated_params = self._aggregate_fit_results(fit_results)
+        aggregated_state = self._params_to_state_dict(aggregated_params)
+        if self.server_attack:
+            aggregated_state = self.server_attack.apply(self.server_id, aggregated_state)
+            aggregated_params = self._state_dict_to_params(aggregated_state)
+        else:
+            aggregated_state = self._params_to_state_dict(aggregated_params)
         self.set_parameters(aggregated_params)
 
         # Evaluate
@@ -251,6 +296,8 @@ def create_multigpu_flower_server(
     strategy: str = "fedavg",
     auto_gpu: bool = True,
     gpu_ids: Optional[List[int]] = None,
+    client_attack: Optional["ClientAttackController"] = None,
+    server_attack: Optional["ServerAttackController"] = None,
 ) -> MultiGPUFlowerServer:
     """Factory function to create a multi-GPU Flower server.
 
@@ -272,4 +319,6 @@ def create_multigpu_flower_server(
         strategy=strategy,
         auto_gpu=auto_gpu,
         gpu_ids=gpu_ids,
+        client_attack=client_attack,
+        server_attack=server_attack,
     )

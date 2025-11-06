@@ -18,6 +18,13 @@ from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
 
 from .flower_client import FlowerClient
+from .utils import clone_state_dict
+
+try:
+    from .attacks import ClientAttackController, ServerAttackController
+except ImportError:  # pragma: no cover - keep compatibility if attacks module absent
+    ClientAttackController = None  # type: ignore
+    ServerAttackController = None  # type: ignore
 
 
 @dataclass
@@ -44,6 +51,8 @@ class FlowerParameterServer:
         model_builder: Callable,
         device: torch.device,
         config: Optional[FlowerServerConfig] = None,
+        client_attack: Optional["ClientAttackController"] = None,
+        server_attack: Optional["ServerAttackController"] = None,
     ) -> None:
         """Initialize Flower parameter server.
 
@@ -57,6 +66,8 @@ class FlowerParameterServer:
         self.device = device
         self.model = model_builder().to(self.device)
         self.config = config or FlowerServerConfig(server_id=server_id)
+        self.client_attack = client_attack
+        self.server_attack = server_attack
 
         # Initialize strategy
         self.strategy = self._create_strategy()
@@ -170,6 +181,7 @@ class FlowerParameterServer:
 
         # Get initial parameters
         initial_parameters = self.get_parameters()
+        initial_state = clone_state_dict(self.model.state_dict())
 
         # Determine if we should use parallel execution
         max_workers = self.config.max_workers
@@ -177,6 +189,9 @@ class FlowerParameterServer:
 
         # === PARALLEL CLIENT TRAINING ===
         fit_results = []
+        client_states: List[Dict[str, torch.Tensor]] = []
+        client_ids: List[int] = []
+        weight_list: List[int] = []
         if use_parallel:
             # Parallel training using ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -192,16 +207,42 @@ class FlowerParameterServer:
                 for future in as_completed(future_to_client):
                     updated_params, num_examples, metrics, client_id = future.result()
                     fit_results.append((updated_params, num_examples, metrics))
+                    client_states.append(self._params_to_state_dict(updated_params))
+                    client_ids.append(client_id)
+                    weight_list.append(num_examples)
         else:
             # Sequential training (original behavior)
             for client in clients:
-                updated_params, num_examples, metrics, _ = self._train_single_client(
+                updated_params, num_examples, metrics, client_id = self._train_single_client(
                     client, initial_parameters, config
                 )
                 fit_results.append((updated_params, num_examples, metrics))
+                client_states.append(self._params_to_state_dict(updated_params))
+                client_ids.append(client_id)
+                weight_list.append(num_examples)
+
+        if self.client_attack and client_states:
+            client_states = self.client_attack.apply(
+                initial_state=initial_state,
+                client_states=client_states,
+                client_ids=client_ids,
+                weights=weight_list,
+            )
+            # Reflect attacked states back into fit_results
+            for idx, state in enumerate(client_states):
+                attacked_params = self._state_dict_to_params(state)
+                params, num_examples, metrics = fit_results[idx]
+                fit_results[idx] = (attacked_params, num_examples, metrics)
 
         # Aggregate using Flower strategy
         aggregated_params = self._aggregate_fit_results(fit_results)
+
+        aggregated_state = self._params_to_state_dict(aggregated_params)
+        if self.server_attack:
+            aggregated_state = self.server_attack.apply(self.server_id, aggregated_state)
+            aggregated_params = self._state_dict_to_params(aggregated_state)
+        else:
+            aggregated_state = self._params_to_state_dict(aggregated_params)
 
         # Update server model
         self.set_parameters(aggregated_params)
@@ -242,8 +283,6 @@ class FlowerParameterServer:
             weights.append(num_train)
 
         # Convert aggregated parameters to state dict
-        aggregated_state = self._params_to_state_dict(aggregated_params)
-
         return {
             "server_id": self.server_id,
             "aggregated_state": aggregated_state,
@@ -294,6 +333,14 @@ class FlowerParameterServer:
             state_dict[name] = torch.tensor(param_array, dtype=torch.float32)
         return state_dict
 
+    def _state_dict_to_params(self, state_dict: Dict[str, torch.Tensor]) -> NDArrays:
+        """Convert a state dict to the NDArrays format expected by Flower."""
+        params_list = []
+        for name, _ in self.model.named_parameters():
+            tensor = state_dict[name]
+            params_list.append(tensor.detach().cpu().numpy())
+        return params_list
+
 
 def create_flower_server(
     server_id: int,
@@ -301,6 +348,8 @@ def create_flower_server(
     device: torch.device,
     strategy: str = "fedavg",
     max_workers: Optional[int] = None,
+    client_attack: Optional["ClientAttackController"] = None,
+    server_attack: Optional["ServerAttackController"] = None,
     **strategy_kwargs,
 ) -> FlowerParameterServer:
     """Factory function to create a Flower parameter server.
@@ -328,4 +377,6 @@ def create_flower_server(
         model_builder=model_builder,
         device=device,
         config=config,
+        client_attack=client_attack,
+        server_attack=server_attack,
     )

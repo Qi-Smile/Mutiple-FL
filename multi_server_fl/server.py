@@ -2,14 +2,24 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .client import Client
-from .utils import clone_state_dict, weighted_average_state_dicts
+from .utils import (
+    clone_state_dict,
+    geometric_median_state_dicts,
+    weighted_average_state_dicts,
+)
+
+try:
+    from .attacks import ClientAttackController, ServerAttackController
+except ImportError:  # pragma: no cover - fallback if attacks module missing
+    ClientAttackController = None  # type: ignore
+    ServerAttackController = None  # type: ignore
 
 
 @dataclass
@@ -19,12 +29,15 @@ class ServerRoundResult:
     client_metrics: List[Dict[str, float]]
     client_ids: List[int]
     weights: List[int]
+    client_acceptance: List[bool] | None = None
+    client_feedback: List[Dict[str, float]] | None = None
 
 
 @dataclass
 class ServerConfig:
     show_progress: bool = False
     max_workers: int | None = None  # Number of clients to train in parallel
+    aggregator: str = "geometric_median"
 
 
 class ParameterServer:
@@ -36,11 +49,15 @@ class ParameterServer:
         model_builder,
         device: torch.device,
         config: ServerConfig | None = None,
+        client_attack: Optional["ClientAttackController"] = None,
+        server_attack: Optional["ServerAttackController"] = None,
     ) -> None:
         self.server_id = server_id
         self.device = device
         self.model = model_builder().to(self.device)
         self.config = config or ServerConfig()
+        self.client_attack = client_attack
+        self.server_attack = server_attack
 
     def get_state_dict(self) -> Dict[str, torch.Tensor]:
         return clone_state_dict(self.model.state_dict())
@@ -67,6 +84,7 @@ class ParameterServer:
         self,
         clients: Sequence[Client],
         test_loader: DataLoader,
+        round_idx: int,
     ) -> ServerRoundResult:
         if not clients:
             raise ValueError("Server must have at least one client to run a round.")
@@ -123,7 +141,28 @@ class ParameterServer:
                 client_metrics.append(metrics)
                 weights.append(num_samples)
 
-        aggregated_state = weighted_average_state_dicts(client_states, weights)
+        if self.client_attack:
+            client_states = self.client_attack.apply(
+                initial_state=initial_state,
+                client_states=client_states,
+                client_ids=client_ids,
+                weights=weights,
+            )
+
+        aggregated_state = self._aggregate_client_states(client_states, weights)
+
+        acceptance_results: List[Dict[str, float]] = []
+        acceptance_flags: List[bool] = []
+        for state, client in zip(client_states, clients):
+            feedback = client.process_server_update(
+                aggregated_state, state, round_idx, metadata=None
+            )
+            acceptance_results.append(feedback)
+            acceptance_flags.append(bool(feedback.get("accepted", 0.0)))
+
+        if self.server_attack:
+            aggregated_state = self.server_attack.apply(self.server_id, aggregated_state)
+
         self.set_state_dict(aggregated_state)
 
         return ServerRoundResult(
@@ -132,4 +171,18 @@ class ParameterServer:
             client_metrics=client_metrics,
             client_ids=client_ids,
             weights=weights,
+            client_acceptance=acceptance_flags,
+            client_feedback=acceptance_results,
         )
+
+    def _aggregate_client_states(
+        self,
+        client_states: Sequence[Dict[str, torch.Tensor]],
+        weights: Sequence[float],
+    ) -> Dict[str, torch.Tensor]:
+        aggregator = (self.config.aggregator or "geometric_median").lower()
+        if aggregator in {"geometric_median", "geom_median", "geom"}:
+            return geometric_median_state_dicts(client_states, weights=weights)
+        if aggregator in {"mean", "weighted"}:
+            return weighted_average_state_dicts(client_states, weights)
+        raise ValueError(f"Unknown aggregator '{self.config.aggregator}'")

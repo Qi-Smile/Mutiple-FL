@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
@@ -7,7 +8,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from .utils import clone_state_dict, to_device
+from .utils import clone_state_dict, flatten_state_dict, to_device, unflatten_state_dict
 
 
 @dataclass
@@ -16,6 +17,18 @@ class ClientConfig:
     local_epochs: int = 1
     optimizer_factory: Optional[Callable[[nn.Module], torch.optim.Optimizer]] = None
     criterion_factory: Optional[Callable[[], nn.Module]] = None
+    acceptance: Optional["AcceptanceConfig"] = None
+    enable_acceptance: bool = True
+
+
+@dataclass
+class AcceptanceConfig:
+    gamma: float = 1.0
+    kappa: float = 0.01
+    min_threshold: float = 0.05
+    blend_on_reject: bool = True
+    blend_factor: float = 0.25
+    max_threshold: float = 2.0
 
 
 class Client:
@@ -34,7 +47,8 @@ class Client:
         self.model_builder = model_builder
         self.device = device
         self.config = config or ClientConfig()
-
+        if self.config.acceptance is None and getattr(self.config, "enable_acceptance", True):
+            self.config.acceptance = AcceptanceConfig()
         self.model = to_device(self.model_builder(), device)
         self.criterion = (
             self.config.criterion_factory() if self.config.criterion_factory else nn.CrossEntropyLoss()
@@ -43,6 +57,12 @@ class Client:
             self.optimizer = self.config.optimizer_factory(self.model)
         else:
             self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        self._next_sync_state: Optional[Dict[str, torch.Tensor]] = clone_state_dict(self.model.state_dict())
+        self._trusted_state: Dict[str, torch.Tensor] = clone_state_dict(self.model.state_dict())
+        self._last_acceptance: bool = True
+        self._last_similarity: float = 0.0
+        self._current_round: int = 0
+        self.is_malicious: bool = False
 
     @property
     def num_train_samples(self) -> int:
@@ -50,7 +70,12 @@ class Client:
 
     def synchronize_with_server(self, state_dict: Dict[str, torch.Tensor]) -> None:
         """Load parameters from server model."""
-        self.model.load_state_dict(state_dict)
+        if self._next_sync_state is not None:
+            self.model.load_state_dict(self._next_sync_state)
+        else:
+            self.model.load_state_dict(state_dict)
+        # Reset buffer after synchronization
+        self._next_sync_state = None
 
     def get_model_state(self) -> Dict[str, torch.Tensor]:
         """Return a cloned copy of local model state."""
@@ -114,3 +139,64 @@ class Client:
             "test_loss": total_loss / max(total_samples, 1),
             "test_accuracy": total_correct / max(total_samples, 1),
         }
+
+    def process_server_update(
+        self,
+        server_state: Dict[str, torch.Tensor],
+        client_state: Dict[str, torch.Tensor],
+        round_idx: int,
+        metadata: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        """Decide whether to accept the aggregated server model."""
+        acceptance = self.config.acceptance
+        if acceptance is None:
+            self._trusted_state = clone_state_dict(server_state)
+            self._next_sync_state = clone_state_dict(server_state)
+            self._last_acceptance = True
+            self._last_similarity = 0.0
+            return {"accepted": 1.0, "similarity": 0.0}
+
+        server_vec = flatten_state_dict(server_state)
+        client_vec = flatten_state_dict(client_state)
+        denom = torch.norm(client_vec).item() + 1e-12
+        diff = torch.norm(server_vec - client_vec).item()
+        ratio = diff / denom
+        threshold = min(
+            acceptance.max_threshold,
+            max(
+                acceptance.min_threshold,
+                acceptance.gamma * math.exp(-acceptance.kappa * round_idx),
+            ),
+        )
+        accepted = ratio <= threshold
+
+        if accepted:
+            self._trusted_state = clone_state_dict(server_state)
+            self._next_sync_state = clone_state_dict(server_state)
+        else:
+            if acceptance.blend_on_reject:
+                blend = acceptance.blend_factor
+                blended_vec = client_vec * (1.0 - blend) + server_vec * blend
+                blended_state = unflatten_state_dict(
+                    blended_vec.to(torch.float32), client_state
+                )
+                self._next_sync_state = clone_state_dict(blended_state)
+            else:
+                self._next_sync_state = clone_state_dict(client_state)
+        self._last_acceptance = accepted
+        self._last_similarity = ratio
+        self._current_round = round_idx
+
+        return {
+            "accepted": 1.0 if accepted else 0.0,
+            "similarity": float(ratio),
+            "threshold": float(threshold),
+        }
+
+    @property
+    def last_acceptance(self) -> bool:
+        return self._last_acceptance
+
+    @property
+    def last_similarity(self) -> float:
+        return self._last_similarity
