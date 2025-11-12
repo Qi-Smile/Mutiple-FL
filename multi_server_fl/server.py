@@ -11,8 +11,14 @@ from tqdm import tqdm
 from .client import Client
 from .utils import (
     clone_state_dict,
+    clipped_clustering_aggregate,
+    dnc_aggregate,
     ensure_finite_state_dict,
+    fltrust_aggregate,
     geometric_median_state_dicts,
+    krum_aggregate,
+    median_state_dicts,
+    signguard_aggregate,
     weighted_average_state_dicts,
 )
 
@@ -39,6 +45,7 @@ class ServerConfig:
     show_progress: bool = False
     max_workers: int | None = None  # Number of clients to train in parallel
     aggregator: str = "geometric_median"
+    aggregator_kwargs: Dict[str, object] = field(default_factory=dict)
 
 
 class ParameterServer:
@@ -55,6 +62,7 @@ class ParameterServer:
     ) -> None:
         self.server_id = server_id
         self.device = device
+        self._model_builder = model_builder
         self.model = model_builder().to(self.device)
         self.config = config or ServerConfig()
         self.client_attack = client_attack
@@ -73,10 +81,14 @@ class ParameterServer:
         test_loader: DataLoader,
     ) -> tuple[int, Dict[str, torch.Tensor], Dict[str, float], int]:
         """Train a single client and return results."""
-        client.synchronize_with_server(initial_state)
-        train_metrics = client.train_one_round()
-        client_state = client.get_model_state()
-        metrics = client.evaluate(test_loader)
+        client.activate_device()
+        try:
+            client.synchronize_with_server(initial_state)
+            train_metrics = client.train_one_round()
+            metrics = client.evaluate(test_loader)
+            client_state = client.get_model_state()
+        finally:
+            client.deactivate_device()
         metrics.update(train_metrics)
         metrics["num_samples"] = client.num_train_samples
         return (client.client_id, client_state, metrics, client.num_train_samples)
@@ -114,6 +126,7 @@ class ParameterServer:
 
                 # Collect results as they complete
                 iterator = as_completed(future_to_client)
+                completed = 0
                 if self.config.show_progress:
                     iterator = tqdm(
                         iterator,
@@ -131,6 +144,14 @@ class ParameterServer:
                     client_metrics.append(metrics)
                     weights.append(num_samples)
                     client_finite_flags.append(is_finite)
+                    if not self.config.show_progress:
+                        completed += 1
+                        if completed % max(1, len(clients) // 4) == 0:
+                            print(
+                                f"[Server {self.server_id}] Completed {completed}/{len(clients)} clients "
+                                f"(round {round_idx})",
+                                flush=True,
+                            )
         else:
             # Sequential execution (original behavior)
             iterator = clients
@@ -157,7 +178,7 @@ class ParameterServer:
                 weights=weights,
             )
 
-        aggregated_state = self._aggregate_client_states(client_states, weights)
+        aggregated_state = self._aggregate_client_states(client_states, weights, initial_state)
         aggregated_state, aggregated_finite = ensure_finite_state_dict(aggregated_state, initial_state)
         if not aggregated_finite:
             aggregated_state = clone_state_dict(initial_state)
@@ -192,10 +213,59 @@ class ParameterServer:
         self,
         client_states: Sequence[Dict[str, torch.Tensor]],
         weights: Sequence[float],
+        initial_state: Dict[str, torch.Tensor] | None = None,
     ) -> Dict[str, torch.Tensor]:
+        if not client_states:
+            raise ValueError("No client states to aggregate.")
+        if initial_state is None:
+            initial_state = self.get_state_dict()
         aggregator = (self.config.aggregator or "geometric_median").lower()
+        aggregator_kwargs = self.config.aggregator_kwargs or {}
         if aggregator in {"geometric_median", "geom_median", "geom"}:
             return geometric_median_state_dicts(client_states, weights=weights)
-        if aggregator in {"mean", "weighted"}:
+        if aggregator in {"mean", "weighted", "fedavg"}:
             return weighted_average_state_dicts(client_states, weights)
+        if aggregator in {"krum"}:
+            default_guess = max(1, len(client_states) // 5)  # Assume 20% malicious if unspecified
+            num_malicious = int(aggregator_kwargs.get("num_byzantine", default_guess))
+            return krum_aggregate(client_states, weights, num_malicious=num_malicious, multi_krum=False)
+        if aggregator in {"multi_krum", "multikrum"}:
+            default_guess = max(1, len(client_states) // 5)
+            num_malicious = int(aggregator_kwargs.get("num_byzantine", default_guess))
+            return krum_aggregate(client_states, weights, num_malicious=num_malicious, multi_krum=True)
+        if aggregator in {"median"}:
+            return median_state_dicts(client_states)
+        if aggregator in {"fltrust"}:
+            return fltrust_aggregate(
+                initial_state=initial_state,
+                client_states=client_states,
+                model_builder=self._model_builder,
+                device=self.device,
+                root_loader=aggregator_kwargs.get("root_loader"),
+                loss_fn=aggregator_kwargs.get("loss_fn"),
+                normalize_updates=bool(aggregator_kwargs.get("normalize_updates", True)),
+                trust_threshold=float(aggregator_kwargs.get("trust_threshold", 0.0)),
+            )
+        if aggregator in {"dnc", "divide_and_conquer", "divide-conquer"}:
+            num_byzantine = int(aggregator_kwargs.get("num_byzantine", 0))
+            num_clusters = int(aggregator_kwargs.get("num_clusters", 2))
+            return dnc_aggregate(
+                initial_state=initial_state,
+                client_states=client_states,
+                num_byzantine=num_byzantine,
+                num_clusters=num_clusters,
+            )
+        if aggregator in {"clippedclustering", "clipped_clustering", "clipped"}:
+            num_clusters = int(aggregator_kwargs.get("num_clusters", 2))
+            clipping_threshold = aggregator_kwargs.get("clipping_threshold")
+            if isinstance(clipping_threshold, str) and clipping_threshold.lower() == "auto":
+                clipping_threshold = None
+            return clipped_clustering_aggregate(
+                initial_state=initial_state,
+                client_states=client_states,
+                num_clusters=num_clusters,
+                clipping_threshold=clipping_threshold,
+            )
+        if aggregator in {"signguard", "sign_guard"}:
+            return signguard_aggregate(initial_state, client_states)
         raise ValueError(f"Unknown aggregator '{self.config.aggregator}'")

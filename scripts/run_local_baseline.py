@@ -14,7 +14,12 @@ from multi_server_fl.data.partition import dirichlet_partition
 from multi_server_fl.data.utils import load_torchvision_dataset, subset_dataset
 from multi_server_fl.logging import LoggerConfig, MetricLogger
 from multi_server_fl.models import get_model_builder
-from multi_server_fl.utils import compute_weighted_mean_and_variance, set_torch_seed
+from multi_server_fl.utils import (
+    build_optimizer_factory,
+    compute_weighted_mean_and_variance,
+    resolve_device,
+    set_torch_seed,
+)
 from result_utils import prepare_output_directory, save_results
 
 
@@ -22,6 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local training baseline (no federation)")
     parser.add_argument("--dataset", type=str, default="mnist", help="Dataset name")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset root directory")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Compute device (e.g., 'cuda:0', '1', or 'cpu'). Defaults to CUDA if available.",
+    )
     parser.add_argument("--num-clients", type=int, default=100, help="Number of clients")
     parser.add_argument("--rounds", type=int, default=20, help="Number of federated rounds (used to match total epochs)")
     parser.add_argument("--local-epochs", type=int, default=1, help="Local epochs per round")
@@ -29,6 +40,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.5, help="Dirichlet alpha for data partition")
     parser.add_argument("--model", type=str, default="lenet", help="Model name")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="sgd",
+        choices=["sgd", "adam", "adamw"],
+        help="Optimizer to use for standalone training",
+    )
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay (L2 penalty)")
     parser.add_argument("--momentum", type=float, default=0.9, help="SGD momentum")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--log", action="store_true", help="Enable SwanLab logging if available")
@@ -85,10 +104,22 @@ def evaluate_model(
     }
 
 
+def _move_model_and_optimizer(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    model.to(device)
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
 def run_local_training(args: argparse.Namespace, logger_run_name: str | None = None) -> List[Dict]:
     set_torch_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     dataset_bundle = load_torchvision_dataset(args.dataset, root=args.data_root)
     train_dataset = dataset_bundle.train
     test_dataset = dataset_bundle.test
@@ -122,6 +153,12 @@ def run_local_training(args: argparse.Namespace, logger_run_name: str | None = N
 
     model_builder = get_model_builder(args.model, num_classes=num_classes, in_channels=in_channels)
     criterion = nn.CrossEntropyLoss()
+    optimizer_factory = build_optimizer_factory(
+        optimizer=args.optimizer,
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
     num_malicious_clients = max(0, min(args.num_clients, int(round(args.num_clients * args.malicious_client_ratio))))
     malicious_client_ids = set(range(num_malicious_clients))
 
@@ -148,8 +185,8 @@ def run_local_training(args: argparse.Namespace, logger_run_name: str | None = N
             num_workers=0,
             pin_memory=device.type == "cuda",
         )
-        model = model_builder().to(device)
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+        model = model_builder().to(torch.device("cpu"))
+        optimizer = optimizer_factory(model)
         client_states.append(
             {
                 "client_id": client_id,
@@ -168,6 +205,7 @@ def run_local_training(args: argparse.Namespace, logger_run_name: str | None = N
         details: List[Dict] = []
 
         for state in tqdm(client_states, desc=f"Round {round_idx}", leave=False):
+            _move_model_and_optimizer(state["model"], state["optimizer"], device)
             for _ in range(client_config.local_epochs):
                 train_one_epoch(
                     state["model"],
@@ -179,6 +217,7 @@ def run_local_training(args: argparse.Namespace, logger_run_name: str | None = N
 
             train_metrics = evaluate_model(state["model"], state["train_loader"], criterion, device)
             test_metrics = evaluate_model(state["model"], test_loader, criterion, device)
+            _move_model_and_optimizer(state["model"], state["optimizer"], torch.device("cpu"))
 
             client_record = {
                 "client_id": state["client_id"],

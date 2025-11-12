@@ -9,6 +9,7 @@
 - ✅ **真正的多GPU并行**：使用多进程实现真正的多GPU并行训练
 - ✅ **Non-IID数据**：支持Dirichlet分布的数据异构性模拟
 - ✅ **SwanLab集成**：实验跟踪和可视化
+- ✅ **按需加载模型**：客户端模型只在训练时迁移到指定GPU（`--device`），降低大规模场景的显存压力
 
 ## 🖥️ GPU支持
 
@@ -147,12 +148,25 @@ Mutiple-FL/
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--dataset` | cifar10 | 数据集 (mnist/cifar10) |
+| `--device` | auto | 计算设备 (`cpu` / `cuda`, 可指定 `cuda:1`) |
 | `--num-clients` | 10 | 客户端数量 |
 | `--num-servers` | 2 | 服务器数量 |
 | `--rounds` | 5 | 全局训练轮次 |
 | `--local-epochs` | 2 | 本地训练轮次 |
 | `--batch-size` | 32 | 批次大小 |
 | `--alpha` | 0.5 | Dirichlet参数 |
+| `--lr` | 0.01 | 学习率 |
+| `--optimizer` | sgd | 客户端优化器 (sgd/adam/adamw) |
+| `--momentum` | 0.9 | SGD动量（仅在 `sgd` 下使用） |
+| `--weight-decay` | 0.0 | L2权重衰减 |
+| `--defense` | ours | 服务器聚合/防御策略（`ours`/`fedavg`/`krum`/`median`/`fltrust`/`dnc`/`clipped`/`signguard`） |
+| `--krum-byzantine-ratio` | 同客户端比例 | 覆盖传递给 Krum 的拜占庭占比（缺省使用 `--malicious-client-ratio`） |
+| `--fltrust-root-percent` | 0.01 | FLTrust 根数据集采样比例（占训练集百分比，至少 1 个样本） |
+| `--dnc-num-clusters` | 2 | DnC 聚类数量 |
+| `--clipped-num-clusters` | 2 | Clipped Clustering 聚类数量 |
+| `--clipped-threshold` | auto | Clipped Clustering 裁剪阈值（`auto` 或显式浮点数） |
+
+> ℹ️ 六种传统拜占庭防御（Krum、Median、FLTrust、DnC、Clipped Clustering、SignGuard）的算法细节与调参建议见 [DEFENSE_STRATEGIES_DOCUMENTATION.md](DEFENSE_STRATEGIES_DOCUMENTATION.md)。在运行 `scripts/run_example.py` 时，通过 `--defense` 及相关超参数即可一键切换基线。
 
 ### Flower特有参数
 

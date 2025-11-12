@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from .utils import clone_state_dict, flatten_state_dict, to_device, unflatten_state_dict
+from .utils import clone_state_dict, flatten_state_dict, unflatten_state_dict
 
 
 @dataclass
@@ -19,6 +19,7 @@ class ClientConfig:
     criterion_factory: Optional[Callable[[], nn.Module]] = None
     acceptance: Optional["AcceptanceConfig"] = None
     enable_acceptance: bool = True
+    data_loader_workers: int = 0
 
 
 @dataclass
@@ -26,8 +27,6 @@ class AcceptanceConfig:
     gamma: float = 1.0
     kappa: float = 0.01
     min_threshold: float = 0.05
-    blend_on_reject: bool = True
-    blend_factor: float = 0.25
     max_threshold: float = 2.0
 
 
@@ -45,11 +44,13 @@ class Client:
         self.client_id = client_id
         self.train_dataset = train_dataset
         self.model_builder = model_builder
-        self.device = device
+        self.device = torch.device(device)
         self.config = config or ClientConfig()
         if self.config.acceptance is None and getattr(self.config, "enable_acceptance", True):
             self.config.acceptance = AcceptanceConfig()
-        self.model = to_device(self.model_builder(), device)
+        self._offload_device = torch.device("cpu")
+        self.model = self.model_builder().to(self._offload_device)
+        self._model_device = self._offload_device
         self.criterion = (
             self.config.criterion_factory() if self.config.criterion_factory else nn.CrossEntropyLoss()
         )
@@ -57,6 +58,7 @@ class Client:
             self.optimizer = self.config.optimizer_factory(self.model)
         else:
             self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        self._model_device = self._offload_device
         self._next_sync_state: Optional[Dict[str, torch.Tensor]] = clone_state_dict(self.model.state_dict())
         self._trusted_state: Dict[str, torch.Tensor] = clone_state_dict(self.model.state_dict())
         self._last_acceptance: bool = True
@@ -77,18 +79,43 @@ class Client:
         # Reset buffer after synchronization
         self._next_sync_state = None
 
-    def get_model_state(self) -> Dict[str, torch.Tensor]:
+    def get_model_state(self, to_cpu: bool = True) -> Dict[str, torch.Tensor]:
         """Return a cloned copy of local model state."""
-        return clone_state_dict(self.model.state_dict())
+        state = clone_state_dict(self.model.state_dict())
+        if to_cpu:
+            state = {k: v.detach().cpu() for k, v in state.items()}
+        return state
+
+    def activate_device(self) -> None:
+        """Move model/optimizer states to the primary compute device."""
+        self._set_model_device(self.device)
+
+    def deactivate_device(self) -> None:
+        """Offload model/optimizer states back to CPU to free GPU memory."""
+        self._set_model_device(self._offload_device)
+
+    def _set_model_device(self, target_device: torch.device) -> None:
+        if self._model_device == target_device:
+            return
+        self.model = self.model.to(target_device)
+        for state in self.optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(target_device)
+        self._model_device = target_device
 
     def _train_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=self.device.type == "cuda",
-        )
+        num_workers = max(0, int(getattr(self.config, "data_loader_workers", 0)))
+        loader_kwargs = {
+            "batch_size": self.config.batch_size,
+            "shuffle": True,
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["persistent_workers"] = True
+        return DataLoader(self.train_dataset, **loader_kwargs)
 
     def train_one_round(self) -> Dict[str, float]:
         self.model.train()
@@ -174,15 +201,7 @@ class Client:
             self._trusted_state = clone_state_dict(server_state)
             self._next_sync_state = clone_state_dict(server_state)
         else:
-            if acceptance.blend_on_reject:
-                blend = acceptance.blend_factor
-                blended_vec = client_vec * (1.0 - blend) + server_vec * blend
-                blended_state = unflatten_state_dict(
-                    blended_vec.to(torch.float32), client_state
-                )
-                self._next_sync_state = clone_state_dict(blended_state)
-            else:
-                self._next_sync_state = clone_state_dict(client_state)
+            self._next_sync_state = clone_state_dict(client_state)
         self._last_acceptance = accepted
         self._last_similarity = ratio
         self._current_round = round_idx

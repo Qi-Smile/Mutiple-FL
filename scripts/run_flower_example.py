@@ -31,12 +31,18 @@ from multi_server_fl.data.utils import load_torchvision_dataset, subset_dataset
 from multi_server_fl.flower_client import create_flower_client
 from multi_server_fl.flower_server import create_flower_server
 from multi_server_fl.models import get_model_builder
-from multi_server_fl.utils import set_torch_seed
+from multi_server_fl.utils import build_optimizer_factory, resolve_device, set_torch_seed
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Flower-based Multi-server FL")
     parser.add_argument("--dataset", type=str, default="cifar10", help="Dataset name")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Compute device (e.g., 'cuda:0', '1', or 'cpu'). Defaults to CUDA if available.",
+    )
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset root")
     parser.add_argument("--num-clients", type=int, default=100, help="Number of clients")
     parser.add_argument("--num-servers", type=int, default=10, help="Number of servers")
@@ -46,6 +52,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.5, help="Dirichlet alpha")
     parser.add_argument("--model", type=str, default="lenet", help="Model name")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="sgd",
+        choices=["sgd", "adam", "adamw"],
+        help="Optimizer to use for Flower clients",
+    )
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay (L2 penalty)")
     parser.add_argument("--momentum", type=float, default=0.9, help="SGD momentum")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--strategy", type=str, default="fedavg", help="FL strategy")
@@ -88,7 +102,7 @@ def main():
     client_attack_params = _load_params(args.client_attack_params)
     server_attack_params = _load_params(args.server_attack_params)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     print(f"Using device: {device}")
 
     # Load dataset
@@ -139,8 +153,11 @@ def main():
     )
 
     # Create optimizer factory and loss function
-    optimizer_factory = lambda model: torch.optim.SGD(
-        model.parameters(), lr=args.lr, momentum=args.momentum
+    optimizer_factory = build_optimizer_factory(
+        optimizer=args.optimizer,
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
     )
     loss_fn = nn.CrossEntropyLoss()
 

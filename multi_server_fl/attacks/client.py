@@ -277,7 +277,7 @@ class _LabelFlipAttack(ClientAttackStrategy):
                 continue
             attacked_state = clone_state_dict(state)
             for name, tensor in state.items():
-                base = initial_state[name]
+                base = initial_state[name].to(tensor.device)
                 delta = tensor - base
                 if self._should_flip(name, tensor):
                     attacked_state[name] = base - delta
