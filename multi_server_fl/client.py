@@ -40,6 +40,8 @@ class Client:
         model_builder: Callable[[], nn.Module],
         device: torch.device,
         config: ClientConfig | None = None,
+        is_malicious: bool = False,
+        gradient_attack_fn: Optional[Callable[[nn.Module], None]] = None,
     ) -> None:
         self.client_id = client_id
         self.train_dataset = train_dataset
@@ -64,7 +66,9 @@ class Client:
         self._last_acceptance: bool = True
         self._last_similarity: float = 0.0
         self._current_round: int = 0
-        self.is_malicious: bool = False
+        # Attack support (Blades-style gradient attacks)
+        self.is_malicious: bool = is_malicious
+        self.gradient_attack_fn: Optional[Callable[[nn.Module], None]] = gradient_attack_fn
 
     @property
     def num_train_samples(self) -> int:
@@ -79,11 +83,31 @@ class Client:
         # Reset buffer after synchronization
         self._next_sync_state = None
 
-    def get_model_state(self, to_cpu: bool = True) -> Dict[str, torch.Tensor]:
-        """Return a cloned copy of local model state."""
+    def get_model_state(
+        self, to_cpu: bool = True, device: Optional[torch.device] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Return a cloned copy of local model state.
+
+        Args:
+            to_cpu: If True, move state to CPU (default for backward compatibility)
+            device: Optional target device. If provided, overrides to_cpu.
+
+        Returns:
+            Dictionary of model parameters
+        """
         state = clone_state_dict(self.model.state_dict())
-        if to_cpu:
+
+        if device is not None:
+            # Explicit device specified
+            state = {k: v.detach().to(device) for k, v in state.items()}
+        elif to_cpu:
+            # Backward compatible: move to CPU
             state = {k: v.detach().cpu() for k, v in state.items()}
+        else:
+            # Keep on current device
+            state = {k: v.detach() for k, v in state.items()}
+
         return state
 
     def activate_device(self) -> None:
@@ -131,6 +155,12 @@ class Client:
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
                 loss.backward()
+
+                # Gradient attack hook (Blades-style)
+                # Malicious clients can manipulate gradients before optimizer.step()
+                if self.is_malicious and self.gradient_attack_fn is not None:
+                    self.gradient_attack_fn(self.model)
+
                 self.optimizer.step()
 
                 total_loss += loss.item() * inputs.size(0)

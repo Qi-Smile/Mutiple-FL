@@ -261,6 +261,84 @@ def geometric_median_state_dicts(
     return unflatten_state_dict(median.to(torch.float32), template)
 
 
+def geometric_median_state_dicts_gpu(
+    state_dicts: Sequence[Dict[str, torch.Tensor]],
+    weights: Sequence[float] | None = None,
+    device: torch.device | None = None,
+    max_iters: int = 50,
+    tol: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """
+    GPU-accelerated geometric median computation via Weiszfeld's algorithm.
+
+    This version keeps all tensors on GPU during computation, significantly
+    faster for large models (e.g., ResNet with 11M parameters).
+
+    Args:
+        state_dicts: List of model state dictionaries
+        weights: Optional weights for each state dict
+        device: Target GPU device. If None, uses the device of state_dicts[0]
+        max_iters: Maximum iterations for Weiszfeld algorithm
+        tol: Convergence tolerance
+
+    Returns:
+        Aggregated state dictionary (on CPU for compatibility)
+    """
+    if len(state_dicts) == 0:
+        raise ValueError("No state dicts provided for aggregation.")
+
+    # Determine device
+    if device is None:
+        # Auto-detect from first state dict
+        first_tensor = next(iter(state_dicts[0].values()))
+        device = first_tensor.device
+
+    # Prepare weights
+    weight_tensor: torch.Tensor
+    if weights is None:
+        weight_tensor = torch.ones(len(state_dicts), dtype=torch.float64, device=device)
+    else:
+        if len(weights) != len(state_dicts):
+            raise ValueError("Number of weights must match number of state dicts.")
+        weight_tensor = torch.tensor(weights, dtype=torch.float64, device=device)
+
+    weight_tensor = torch.clamp(weight_tensor, min=0.0)
+    if weight_tensor.sum() == 0:
+        weight_tensor = torch.ones_like(weight_tensor)
+
+    # Flatten and move to GPU
+    flat_states = torch.stack([
+        flatten_state_dict(state).to(torch.float64).to(device)
+        for state in state_dicts
+    ])
+    weight_tensor = weight_tensor / weight_tensor.sum()
+
+    # Initialize median as weighted mean
+    median = (flat_states * weight_tensor.unsqueeze(1)).sum(dim=0)
+
+    # Weiszfeld's algorithm (on GPU)
+    eps = 1e-12
+    for _ in range(max_iters):
+        distances = torch.norm(flat_states - median, dim=1).clamp_min(eps)
+        inverted = weight_tensor / distances
+        inverted_sum = inverted.sum()
+
+        if inverted_sum.item() == 0:
+            break
+
+        new_median = (flat_states * inverted.unsqueeze(1)).sum(dim=0) / inverted_sum
+        shift = torch.norm(new_median - median)
+        median = new_median
+
+        if shift.item() < tol:
+            break
+
+    # Move result back to CPU for compatibility
+    template = state_dicts[0]
+    median_cpu = median.to(torch.float32).cpu()
+    return unflatten_state_dict(median_cpu, template)
+
+
 def direction_aware_aggregation(
     state_dicts: Sequence[Dict[str, torch.Tensor]],
     weights: Sequence[float] | None = None,
@@ -351,10 +429,14 @@ def krum_aggregate(
     multi_krum: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
-    Krum aggregation for Byzantine-resilient FL.
+    Krum aggregation for Byzantine-resilient FL with improved robustness.
 
     Krum selects the update with minimum sum of distances to its neighbors.
     Multi-Krum averages the top-m selected updates.
+
+    Fixed issues:
+    - Added outlier detection to filter extreme updates
+    - Improved numerical stability for edge cases
 
     Args:
         state_dicts: List of model state dicts
@@ -376,6 +458,29 @@ def krum_aggregate(
 
     # Flatten all states
     vecs = torch.stack([flatten_state_dict(state).to(torch.float32) for state in state_dicts])
+
+    # Outlier detection: filter updates with extremely large norms
+    # This prevents IPM and other attacks from causing NaN
+    norms = torch.norm(vecs, dim=1)
+    median_norm = norms.median()
+
+    # Filter out updates that are more than 10x the median norm
+    valid_mask = norms < median_norm * 10.0
+
+    # Ensure we keep at least half the updates
+    if valid_mask.sum() < n // 2:
+        # Too many filtered, don't filter
+        valid_mask = torch.ones(n, dtype=torch.bool)
+
+    # Apply filter
+    valid_indices = torch.where(valid_mask)[0].tolist()
+    if len(valid_indices) < len(state_dicts):
+        import warnings
+        warnings.warn(f"Krum: Filtered {n - len(valid_indices)}/{n} updates with extreme norms")
+        state_dicts = [state_dicts[i] for i in valid_indices]
+        vecs = vecs[valid_mask]
+        n = len(state_dicts)
+        f = min(f, n // 3)  # Adjust malicious estimate
 
     # Compute pairwise L2 distances
     distances = torch.cdist(vecs, vecs, p=2)  # [n, n]
@@ -403,6 +508,124 @@ def krum_aggregate(
         # Single Krum: return the best one
         best_idx = scores.index(min(scores))
         return clone_state_dict(state_dicts[best_idx])
+
+
+def krum_aggregate_gpu(
+    state_dicts: Sequence[Dict[str, torch.Tensor]],
+    weights: Sequence[float] | None = None,
+    device: torch.device | None = None,
+    num_malicious: int = 0,
+    multi_krum: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    GPU-accelerated Krum aggregation for Byzantine-resilient FL.
+
+    This version performs all distance computation and sorting on GPU,
+    significantly faster for large models and many clients.
+
+    Args:
+        state_dicts: List of client state dictionaries
+        weights: Optional weights (not used in Krum, but kept for interface compatibility)
+        device: Target GPU device. If None, auto-detects from first state dict
+        num_malicious: Estimated number of Byzantine clients (f)
+        multi_krum: If True, average top m updates; else return single best
+
+    Returns:
+        Aggregated state dictionary (on CPU for compatibility)
+    """
+    if len(state_dicts) == 0:
+        raise ValueError("No state dicts provided for aggregation.")
+    if len(state_dicts) == 1:
+        return clone_state_dict(state_dicts[0])
+
+    # Determine device
+    if device is None:
+        first_tensor = next(iter(state_dicts[0].values()))
+        device = first_tensor.device
+
+    n = len(state_dicts)
+    f = min(num_malicious, n // 3)
+
+    # Flatten and move to GPU
+    vecs = torch.stack([
+        flatten_state_dict(state).to(torch.float32).to(device)
+        for state in state_dicts
+    ])  # [n, d]
+
+    # Outlier detection (same as CPU version)
+    norms = torch.norm(vecs, dim=1)
+    median_norm = norms.median()
+    valid_mask = norms < median_norm * 10.0
+
+    if valid_mask.sum() < n // 2:
+        valid_mask = torch.ones(n, dtype=torch.bool, device=device)
+
+    # Apply filter if needed
+    valid_indices = torch.where(valid_mask)[0]
+    if len(valid_indices) < len(state_dicts):
+        import warnings
+        warnings.warn(f"Krum GPU: Filtered {n - len(valid_indices)}/{n} updates with extreme norms")
+        state_dicts = [state_dicts[i.item()] for i in valid_indices]
+        vecs = vecs[valid_mask]
+        n = len(state_dicts)
+        f = min(f, n // 3)
+
+    # Compute pairwise L2 distances (on GPU)
+    distances = torch.cdist(vecs, vecs, p=2)  # [n, n] on GPU
+
+    # Compute Krum scores (vectorized on GPU)
+    n_select = max(1, n - f - 2)
+    sorted_distances, _ = torch.sort(distances, dim=1)  # GPU sort
+    scores = sorted_distances[:, 1:n_select+1].sum(dim=1)  # GPU sum, skip self (index 0)
+
+    # Select update(s) with minimum score
+    if multi_krum:
+        # Multi-Krum: average top m updates
+        m = max(1, n - f - 2)
+        selected_indices = torch.argsort(scores)[:m].cpu().tolist()
+        selected_states = [state_dicts[i] for i in selected_indices]
+        selected_weights = [1.0 / m] * m
+        return weighted_average_state_dicts(selected_states, selected_weights)
+    else:
+        # Single Krum: return the best one
+        best_idx = torch.argmin(scores).item()
+        return clone_state_dict(state_dicts[best_idx])
+
+
+def median_state_dicts_gpu(
+    state_dicts: Sequence[Dict[str, torch.Tensor]],
+    device: torch.device | None = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    GPU-accelerated coordinate-wise median aggregation.
+
+    Args:
+        state_dicts: List of model state dictionaries
+        device: Target GPU device. If None, auto-detects from first state dict
+
+    Returns:
+        Aggregated state dictionary (on CPU for compatibility)
+    """
+    if len(state_dicts) == 0:
+        raise ValueError("No state dicts provided for aggregation.")
+
+    # Determine device
+    if device is None:
+        first_tensor = next(iter(state_dicts[0].values()))
+        device = first_tensor.device
+
+    # Stack and move to GPU
+    flat_states = torch.stack([
+        flatten_state_dict(state).to(torch.float32).to(device)
+        for state in state_dicts
+    ])
+
+    # Compute median on GPU
+    median_vec = flat_states.median(dim=0).values
+
+    # Move back to CPU
+    median_cpu = median_vec.cpu()
+    return unflatten_state_dict(median_cpu, state_dicts[0])
 
 
 def _stack_state_tensors(
@@ -479,27 +702,47 @@ def fltrust_aggregate(
     normalize_updates: bool = True,
     trust_threshold: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
-    """FLTrust aggregation."""
+    """
+    FLTrust aggregation with improved numerical stability.
+
+    Fixed issues:
+    - Added max clipping for scale factor to prevent extreme magnification
+    - Added NaN detection and fallback to simple average
+    - Increased minimum norm threshold from 1e-12 to 1e-6
+    """
     if len(client_states) == 0:
         raise ValueError("No client states provided for aggregation.")
+
     update_matrix, base_vec = _compute_client_update_matrix(client_states, initial_state)
     root_grad = _compute_root_gradient_vector(model_builder, initial_state, root_loader, device, loss_fn)
-    root_norm = torch.norm(root_grad).clamp(min=1e-12)
+    root_norm = torch.norm(root_grad).clamp(min=1e-6)  # Increased from 1e-12
+
     if normalize_updates:
-        update_norms = torch.norm(update_matrix, dim=1).clamp(min=1e-12)
-        scale = (root_norm / update_norms).unsqueeze(1)
-        normalized_updates = update_matrix * scale
+        update_norms = torch.norm(update_matrix, dim=1).clamp(min=1e-6)  # Increased from 1e-12
+        scale = (root_norm / update_norms).clamp(max=10.0)  # Limit maximum scaling to prevent explosion
+        normalized_updates = update_matrix * scale.unsqueeze(1)
+
+        # Numerical stability check: detect NaN or Inf
+        if torch.any(torch.isnan(normalized_updates)) or torch.any(torch.isinf(normalized_updates)):
+            # Fallback to simple average if normalization fails
+            import warnings
+            warnings.warn("FLTrust: NaN/Inf detected in normalization, falling back to weighted average")
+            return weighted_average_state_dicts(client_states, [1] * len(client_states))
     else:
         normalized_updates = update_matrix
-    update_norms = torch.norm(normalized_updates, dim=1).clamp(min=1e-12)
+
+    update_norms = torch.norm(normalized_updates, dim=1).clamp(min=1e-6)
     cos_sim = (normalized_updates @ root_grad) / (update_norms * root_norm)
     trust_scores = torch.clamp(cos_sim, min=trust_threshold)
+
     if trust_scores.sum() <= 0:
         trust_scores = torch.ones_like(trust_scores) / trust_scores.numel()
     else:
         trust_scores = trust_scores / trust_scores.sum()
+
     aggregated_update = (normalized_updates * trust_scores.unsqueeze(1)).sum(dim=0)
     aggregated_vec = base_vec + aggregated_update
+
     return unflatten_state_dict(aggregated_vec, initial_state)
 
 

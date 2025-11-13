@@ -326,13 +326,8 @@ def main() -> None:
             enable_acceptance=enable_acceptance,
             data_loader_workers=args.num_workers,
         )
-        clients = []
-        for client_id, indices in enumerate(partition.client_indices):
-            client_dataset = subset_dataset(train_dataset, indices)
-            client = Client(client_id=client_id, train_dataset=client_dataset, model_builder=model_builder, device=device, config=client_config)
-            client.is_malicious = client_id in malicious_client_ids
-            clients.append(client)
 
+        # Create attack controller first to determine attack type
         client_attack_controller = ClientAttackController(
             malicious_client_ids=malicious_client_ids,
             config=ClientAttackConfig(
@@ -340,6 +335,28 @@ def main() -> None:
                 params=client_attack_params,
             ),
         )
+
+        # Create clients with appropriate attack functions
+        clients = []
+        for client_id, indices in enumerate(partition.client_indices):
+            client_dataset = subset_dataset(train_dataset, indices)
+            is_malicious = client_id in malicious_client_ids
+
+            # For gradient-space attacks, create attack function
+            gradient_attack_fn = None
+            if is_malicious and client_attack_controller.attack_type == "gradient":
+                gradient_attack_fn = client_attack_controller.create_gradient_attack()
+
+            client = Client(
+                client_id=client_id,
+                train_dataset=client_dataset,
+                model_builder=model_builder,
+                device=device,
+                config=client_config,
+                is_malicious=is_malicious,
+                gradient_attack_fn=gradient_attack_fn,
+            )
+            clients.append(client)
         server_attack_controller = ServerAttackController(
             malicious_server_ids=malicious_server_ids,
             config=ServerAttackConfig(
